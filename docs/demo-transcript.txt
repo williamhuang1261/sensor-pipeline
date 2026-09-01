@@ -1,0 +1,64 @@
+=== Building driver ===
+make: Entering directory '/home/williamhuang.guest/sensor-pipeline-clean/driver'
+make -C /lib/modules/7.0.0-28-generic/build M=/home/williamhuang.guest/sensor-pipeline-clean/driver modules
+make[1]: Entering directory '/usr/src/linux-headers-7.0.0-28-generic'
+make[2]: Entering directory '/home/williamhuang.guest/sensor-pipeline-clean/driver'
+warning: the compiler differs from the one used to build the kernel
+  The kernel was built by: aarch64-linux-gnu-gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+  You are using:           gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+warning: pahole version differs from the one used to build the kernel
+  The kernel was built with: 131
+  You are using:             0
+  CC [M]  sensor_i2c.o
+  MODPOST Module.symvers
+  CC [M]  sensor_i2c.mod.o
+  CC [M]  .module-common.o
+  LD [M]  sensor_i2c.ko
+  BTF [M] sensor_i2c.ko
+Skipping BTF generation for sensor_i2c.ko due to unavailability of vmlinux
+make[2]: Leaving directory '/home/williamhuang.guest/sensor-pipeline-clean/driver'
+make[1]: Leaving directory '/usr/src/linux-headers-7.0.0-28-generic'
+make: Leaving directory '/home/williamhuang.guest/sensor-pipeline-clean/driver'
+
+=== Building daemon ===
+make: Entering directory '/home/williamhuang.guest/sensor-pipeline-clean/daemon'
+cc -Wall -Wextra -O2 -std=c11 -o sensord sensord.c pool_allocator.c
+make: Leaving directory '/home/williamhuang.guest/sensor-pipeline-clean/daemon'
+
+=== Seeding i2c-stub ===
+Loading i2c-dev and i2c-stub...
+i2c-stub adapter is bus 0
+Seeded registers:
+0x60
+0x1a
+0x2b
+0x3c
+0x4d
+0x50
+Bus number for later i2cset/i2cget calls: 0
+Instantiating bme280_stub client on bus 0 at 0x76...
+Done. Now insmod driver/sensor_i2c.ko and check dmesg.
+
+=== Loading sensor_i2c.ko ===
+
+=== dmesg (probe output) ===
+[  675.501371] i2c-stub: Virtual chip at 0x76
+[  675.508303] i2c i2c-0: new_device: Instantiated device bme280_stub at 0x76
+[  675.509680] bme280_stub 0-0076: chip id 0x60 confirmed
+[  675.509682] bme280_stub 0-0076: probed at 0x76, calibration bytes: 1a 2b 3c 4d
+[  675.509736] bme280_stub 0-0076: poll thread started, interval 500 ms
+[  675.509768] sensor_i2c: loaded, /dev/sensor0 ready (major 510), i2c driver 'bme280_stub' registered
+
+=== Running sensord ===
+sensord: reading 8 samples from /dev/sensor0
+sample #0: seq=1 ts_ns=675283524387 raw=0x50
+sample #1: seq=2 ts_ns=675795907689 raw=0x50
+sample #2: seq=3 ts_ns=676303641861 raw=0x50
+sample #3: seq=4 ts_ns=676808888946 raw=0x50
+sample #4: seq=5 ts_ns=677314315573 raw=0x50
+sample #5: seq=6 ts_ns=677817173613 raw=0x50
+sample #6: seq=7 ts_ns=678320309654 raw=0x50
+sample #7: seq=8 ts_ns=678825676406 raw=0x50
+
+=== Tearing down ===
+Clean unload complete.
