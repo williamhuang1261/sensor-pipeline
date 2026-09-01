@@ -10,6 +10,12 @@
  * register file. `scripts/seed_stub.sh` seeds that register file and
  * instantiates this driver's client on the stub adapter; see the README's
  * "Hardware re-scoping" section for the full explanation.
+ *
+ * A kernel thread polls the sensor's measurement register on a fixed
+ * interval and pushes each reading into a kfifo ring buffer; userspace
+ * read()s block until a sample is queued and drain it from there, so a
+ * burst of readings between reads is never dropped and a slow reader can
+ * never stall the sampling thread.
  */
 
 #include <linux/module.h>
@@ -21,49 +27,117 @@
 #include <linux/errno.h>
 #include <linux/i2c.h>
 #include <linux/slab.h>
+#include <linux/kfifo.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/wait.h>
+#include <linux/spinlock.h>
+#include <linux/sched.h>
+#include <linux/ktime.h>
 
 #define DEVICE_NAME "sensor0"
 #define CLASS_NAME  "sensor_i2c"
 #define DRIVER_NAME "bme280_stub"
 
 /* Register layout mirrors a real BME280 closely enough to be a faithful
- * stand-in: a fixed chip-id register plus a small calibration block. A real
- * BME280 has a much larger calibration table (0x88-0xA1); this keeps only
- * enough of it to prove the probe path reads real, seeded register bytes.
+ * stand-in: a fixed chip-id register, a small calibration block, and one
+ * measurement register the kthread re-reads every poll. A real BME280
+ * packs temperature/pressure/humidity across several burst-read registers;
+ * this keeps one byte to keep the ring-buffer plumbing the focus.
  */
-#define REG_CHIP_ID    0x00
-#define CHIP_ID_VALUE  0x60 /* the real BME280's chip-id value */
-#define REG_CALIB_BASE 0x01
-#define CALIB_LEN      4
+#define REG_CHIP_ID      0x00
+#define CHIP_ID_VALUE    0x60 /* the real BME280's chip-id value */
+#define REG_CALIB_BASE   0x01
+#define CALIB_LEN        4
+#define REG_MEASUREMENT  0x05
+
+#define POLL_INTERVAL_MS 500
+#define FIFO_CAPACITY     32 /* samples; must be a power of two for kfifo */
+
+struct sample {
+	u64 seq;
+	u64 ts_ns;
+	u8 raw;
+};
 
 struct sensor_priv {
 	struct i2c_client *client;
 	u8 calib[CALIB_LEN];
+	struct task_struct *poll_task;
 };
 
-static const char fixed_pattern[] = "sensor_i2c: skeleton, no sensor bound yet\n";
+static DEFINE_KFIFO(sample_fifo, struct sample, FIFO_CAPACITY);
+static DEFINE_SPINLOCK(fifo_lock);
+static DECLARE_WAIT_QUEUE_HEAD(fifo_wait);
+static u64 sample_seq;
 
 static dev_t dev_num;
 static struct cdev sensor_cdev;
 static struct class *sensor_class;
 static struct device *sensor_device;
 
+static int sensor_poll_thread(void *data)
+{
+	struct sensor_priv *priv = data;
+	int val;
+	struct sample s;
+
+	while (!kthread_should_stop()) {
+		val = i2c_smbus_read_byte_data(priv->client, REG_MEASUREMENT);
+		if (val < 0) {
+			dev_warn(&priv->client->dev,
+				 "measurement read failed: %d\n", val);
+		} else {
+			s.seq = ++sample_seq;
+			s.ts_ns = ktime_get_ns();
+			s.raw = (u8)val;
+
+			spin_lock(&fifo_lock);
+			if (kfifo_is_full(&sample_fifo))
+				kfifo_skip(&sample_fifo); /* drop oldest, keep sampling live */
+			kfifo_in(&sample_fifo, &s, 1);
+			spin_unlock(&fifo_lock);
+
+			wake_up_interruptible(&fifo_wait);
+		}
+
+		msleep_interruptible(POLL_INTERVAL_MS);
+	}
+
+	return 0;
+}
+
 static ssize_t sensor_read(struct file *filp, char __user *buf, size_t count,
 			    loff_t *offp)
 {
-	size_t len = sizeof(fixed_pattern) - 1;
+	struct sample s;
+	char line[64];
+	int len;
+	unsigned int copied;
+	int ret;
 
-	if (*offp >= len)
-		return 0; /* EOF: one read returns the whole pattern, like /proc files do */
+	ret = wait_event_interruptible(fifo_wait, !kfifo_is_empty(&sample_fifo));
+	if (ret)
+		return ret;
 
-	if (count > len - *offp)
-		count = len - *offp;
+	spin_lock(&fifo_lock);
+	ret = kfifo_out(&sample_fifo, &s, 1);
+	spin_unlock(&fifo_lock);
 
-	if (copy_to_user(buf, fixed_pattern + *offp, count))
+	if (!ret)
+		return -EAGAIN; /* raced with another reader; caller may retry */
+
+	len = scnprintf(line, sizeof(line), "seq=%llu ts_ns=%llu raw=0x%02x\n",
+			 s.seq, s.ts_ns, s.raw);
+
+	if (count < (size_t)len)
+		return -EINVAL;
+
+	if (copy_to_user(buf, line, len))
 		return -EFAULT;
 
-	*offp += count;
-	return count;
+	copied = len;
+	return copied;
 }
 
 static int sensor_open(struct inode *inode, struct file *filp)
@@ -125,11 +199,28 @@ static int sensor_i2c_probe(struct i2c_client *client)
 		 client->addr, priv->calib[0], priv->calib[1], priv->calib[2],
 		 priv->calib[3]);
 
+	priv->poll_task = kthread_run(sensor_poll_thread, priv,
+				       "sensor_i2c_poll");
+	if (IS_ERR(priv->poll_task)) {
+		int ret = PTR_ERR(priv->poll_task);
+
+		dev_err(&client->dev, "failed to start poll thread: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(&client->dev, "poll thread started, interval %d ms\n",
+		 POLL_INTERVAL_MS);
+
 	return 0;
 }
 
 static void sensor_i2c_remove(struct i2c_client *client)
 {
+	struct sensor_priv *priv = i2c_get_clientdata(client);
+
+	if (priv->poll_task)
+		kthread_stop(priv->poll_task);
+
 	dev_info(&client->dev, "removed\n");
 }
 
@@ -218,4 +309,4 @@ module_exit(sensor_i2c_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("William Huang");
-MODULE_DESCRIPTION("Character-device driver bound to a BME280-like I2C sensor");
+MODULE_DESCRIPTION("Character-device driver bound to a BME280-like I2C sensor, kfifo-buffered");

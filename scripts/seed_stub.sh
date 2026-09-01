@@ -32,12 +32,20 @@ i2cset -y "${BUS}" "${CHIP_ADDR}" 0x02 0x2b
 i2cset -y "${BUS}" "${CHIP_ADDR}" 0x03 0x3c
 i2cset -y "${BUS}" "${CHIP_ADDR}" 0x04 0x4d
 
+# Register 0x05: the "measurement" register the poll thread re-reads every
+# interval. Change it live while the module is loaded, e.g.:
+#   sudo i2cset -y ${BUS} ${CHIP_ADDR} 0x05 0x99
+# to prove successive reads pick up the new value.
+i2cset -y "${BUS}" "${CHIP_ADDR}" 0x05 0x50
+
 echo "Seeded registers:"
 i2cget -y "${BUS}" "${CHIP_ADDR}" 0x00
 i2cget -y "${BUS}" "${CHIP_ADDR}" 0x01
 i2cget -y "${BUS}" "${CHIP_ADDR}" 0x02
 i2cget -y "${BUS}" "${CHIP_ADDR}" 0x03
 i2cget -y "${BUS}" "${CHIP_ADDR}" 0x04
+i2cget -y "${BUS}" "${CHIP_ADDR}" 0x05
+echo "Bus number for later i2cset/i2cget calls: ${BUS}"
 
 echo "Instantiating bme280_stub client on bus ${BUS} at ${CHIP_ADDR}..."
 echo "bme280_stub ${CHIP_ADDR}" > "/sys/bus/i2c/devices/i2c-${BUS}/new_device"
